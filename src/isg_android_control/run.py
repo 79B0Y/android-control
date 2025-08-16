@@ -4,24 +4,53 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
-import uvicorn
+# Optional imports so the module can be imported without full runtime deps
+try:  # pragma: no cover - best effort import
+    import uvicorn  # type: ignore
+except Exception:  # ImportError or runtime issues
+    uvicorn = None  # type: ignore
 
-from .api.main import create_app
-from .mqtt.ha import HAIntegration
-from .mqtt.state import set_ha
+try:  # pragma: no cover
+    from .api.main import create_app
+except Exception:
+    create_app = None  # type: ignore
+
+# Only import MQTT integrations for type checking to avoid hard runtime deps
+if TYPE_CHECKING:  # pragma: no cover
+    from .mqtt.ha import HAIntegration  # noqa: F401
+    from .mqtt.state import set_ha  # noqa: F401
 from .core.adb import ADBError
 from . import __version__
 
 
-app = create_app()
-settings = app.state.settings
-adb = app.state.adb
-monitor = app.state.monitor
-shots = app.state.shots
-cache = app.state.cache
+# Initialize app lazily to support import in minimal environments (e.g., tests)
+if create_app is not None:
+    try:
+        app = create_app()
+        settings = app.state.settings
+        adb = app.state.adb
+        monitor = app.state.monitor
+        shots = app.state.shots
+        cache = app.state.cache
+    except Exception:
+        # Fall back to placeholders if app creation fails (dependencies missing)
+        app = SimpleNamespace(state=SimpleNamespace())  # type: ignore
+        settings = SimpleNamespace()  # type: ignore
+        adb = None  # type: ignore
+        monitor = None  # type: ignore
+        shots = None  # type: ignore
+        cache = None  # type: ignore
+else:
+    app = SimpleNamespace(state=SimpleNamespace())  # type: ignore
+    settings = SimpleNamespace()  # type: ignore
+    adb = None  # type: ignore
+    monitor = None  # type: ignore
+    shots = None  # type: ignore
+    cache = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +143,7 @@ def _maybe_compress_image(raw: bytes) -> bytes:
     return get_image_processor().compress_image(raw)
 
 
-async def publish_screen_state(ha: HAIntegration) -> None:
+async def publish_screen_state(ha) -> None:
     """Update cached metrics with current screen state and publish."""
     screen_info = {}
     
@@ -151,6 +180,9 @@ async def publish_screen_state(ha: HAIntegration) -> None:
     
     # Update cache and publish
     try:
+        # cache is injected during tests; guard for None in minimal envs
+        if cache is None:
+            return
         metrics = await cache.get_json("metrics") or {}
         metrics.setdefault("screen", {}).update(screen_info)
         
@@ -162,6 +194,28 @@ async def publish_screen_state(ha: HAIntegration) -> None:
         )
     except Exception as e:
         logger.debug("Failed to update screen state cache/publish: %s", e)
+
+
+async def publish_audio_state(ha) -> None:
+    """Update cached metrics with current audio info and publish."""
+    try:
+        if cache is None:
+            return
+        try:
+            audio = await adb._get_audio_info()  # reuse helper to format
+        except Exception:
+            return
+        if not audio:
+            return
+        metrics = await cache.get_json("metrics") or {}
+        metrics["audio"] = audio
+        await asyncio.gather(
+            cache.set_json("metrics", metrics, ttl=20),
+            asyncio.to_thread(ha.publish_state, metrics),
+            return_exceptions=True,
+        )
+    except Exception as e:
+        logger.debug("Failed to update audio state cache/publish: %s", e)
 
 
 async def screen_watcher(ha: HAIntegration) -> None:
@@ -191,6 +245,10 @@ async def screen_watcher(ha: HAIntegration) -> None:
         await asyncio.sleep(poll_interval)
 
 async def mqtt_worker() -> None:
+    # Import at runtime to avoid dependency at import time
+    from .mqtt.ha import HAIntegration
+    from .mqtt.state import set_ha
+
     ha = HAIntegration(
         settings.mqtt,
         device_id=settings.device.device_id,
@@ -491,6 +549,20 @@ async def mqtt_worker() -> None:
         raise
 
 
+def _to_int(val: str, *, clamp: tuple[int, int] | None = None) -> int:
+    try:
+        num = int(val)
+    except Exception:
+        num = int(round(float(val)))
+    if clamp:
+        lo, hi = clamp
+        if num < lo:
+            num = lo
+        if num > hi:
+            num = hi
+    return num
+
+
 async def handle_command(topic: str | None, payload: str, ha: HAIntegration) -> None:
     """Handle MQTT commands with optimized processing and validation."""
     if not payload or not payload.strip():
@@ -509,28 +581,41 @@ async def handle_command(topic: str | None, payload: str, ha: HAIntegration) -> 
         elif payload.startswith("volume_pct:"):
             _, val = payload.split(":", 1)
             try:
-                await adb.set_volume_percent(int(val))
+                pct = _to_int(val, clamp=(0, 100))
+                await adb.set_volume_percent(pct)
+                await publish_audio_state(ha)
             except Exception:
                 return
         elif payload.startswith("volume_index:"):
             _, val = payload.split(":", 1)
             try:
-                await adb.set_volume_index(int(val))
+                idx = _to_int(val)
+                await adb.set_volume_index(idx)
+                await publish_audio_state(ha)
             except Exception:
                 return
         elif payload.startswith("screen:"):
             _, act = payload.split(":", 1)
             await adb.screen(act)
+            # Immediately publish latest screen state for responsive HA switch
+            try:
+                await publish_screen_state(ha)
+            except Exception:
+                pass
         elif payload.startswith("brightness:"):
             _, val = payload.split(":", 1)
-            await adb.set_brightness(int(val))
+            try:
+                await adb.set_brightness(_to_int(val, clamp=(0, 255)))
+                await publish_screen_state(ha)
+            except Exception:
+                return
         elif payload.startswith("brightness_pct:"):
             _, val = payload.split(":", 1)
             try:
-                pct = int(val)
-                pct = max(0, min(100, pct))
+                pct = _to_int(val, clamp=(0, 100))
                 br = round(pct * 255 / 100)
                 await adb.set_brightness(int(br))
+                await publish_screen_state(ha)
             except Exception:
                 return
         elif payload.startswith("app:"):
